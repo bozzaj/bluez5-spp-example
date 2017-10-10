@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include <sys/types.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 
 #include <gio/gio.h>
@@ -43,11 +44,11 @@ struct sockaddr_rc {
 };
 
 struct spp_data {
-	GMainLoop *loop;	
+	GMainLoop *loop;
 	int sock_fd;
 	gboolean server;
 	struct sockaddr_rc local;
-	struct sockaddr_rc remote;	
+	struct sockaddr_rc remote;
 };
 
 int register_profile(struct spp_data *spp, GDBusProxy *proxy)
@@ -57,13 +58,13 @@ int register_profile(struct spp_data *spp, GDBusProxy *proxy)
 	GError *error = NULL;
 
 	printf("register_profile called!\n");
-	
+
 	g_variant_builder_init(&profile_builder, G_VARIANT_TYPE("(osa{sv})"));
 
 	if (g_variant_is_object_path("/bluetooth/profile/serial_port")) {
 		printf("object path is good!\n");
 	}
-	
+
 	g_variant_builder_add (&profile_builder, "o",
 			"/bluetooth/profile/serial_port");
 
@@ -71,17 +72,24 @@ int register_profile(struct spp_data *spp, GDBusProxy *proxy)
 
 	g_variant_builder_open(&profile_builder, G_VARIANT_TYPE("a{sv}"));
 
-        // not specifying AutoConnect...
-	
-	g_variant_builder_open(&profile_builder, G_VARIANT_TYPE("{sv}"));	
-	g_variant_builder_add (&profile_builder, "s", "Channel");
-	g_variant_builder_add (&profile_builder, "v", g_variant_new_uint16(22));
+	g_variant_builder_open(&profile_builder, G_VARIANT_TYPE("{sv}"));
+	g_variant_builder_add (&profile_builder, "s", "AutoConnect");
+	g_variant_builder_add (&profile_builder, "v", g_variant_new_boolean(true));
 	g_variant_builder_close(&profile_builder);
 
 	g_variant_builder_open(&profile_builder, G_VARIANT_TYPE("{sv}"));
-	g_variant_builder_add (&profile_builder, "s", "Service");
-	g_variant_builder_add (&profile_builder, "v",
-			g_variant_new_string(SERIAL_PORT_PROFILE_UUID));
+	g_variant_builder_add (&profile_builder, "s", "RequireAuthentication");
+	g_variant_builder_add (&profile_builder, "v", g_variant_new_boolean(false));
+	g_variant_builder_close(&profile_builder);
+
+	g_variant_builder_open(&profile_builder, G_VARIANT_TYPE("{sv}"));
+	g_variant_builder_add (&profile_builder, "s", "RequireAuthorization");
+	g_variant_builder_add (&profile_builder, "v", g_variant_new_boolean(false));
+	g_variant_builder_close(&profile_builder);
+
+	g_variant_builder_open(&profile_builder, G_VARIANT_TYPE("{sv}"));
+	g_variant_builder_add (&profile_builder, "s", "Channel");
+	g_variant_builder_add (&profile_builder, "v", g_variant_new_uint16(22));
 	g_variant_builder_close(&profile_builder);
 
 	g_variant_builder_open(&profile_builder, G_VARIANT_TYPE("{sv}"));
@@ -100,7 +108,7 @@ int register_profile(struct spp_data *spp, GDBusProxy *proxy)
 		g_variant_builder_add (&profile_builder, "v",
 				g_variant_new_string("client"));
 	}
-		
+
 	g_variant_builder_close(&profile_builder);
 
 
@@ -120,15 +128,20 @@ int register_profile(struct spp_data *spp, GDBusProxy *proxy)
 }
 
 gboolean
-server_read_data (gpointer user_data) {
+server_read_write_data (gpointer user_data) {
 	char buf[1024] = { 0 };
 	int bytes_read;
 	int opts = 0;
 	struct spp_data *spp = user_data;
-	
-	printf("server_read_data called\n");
+    int rv = 0;
+    fd_set set;
+    struct timeval timeout;
+    int minLen = 1;
+    int wstatus;
 
-	// set socket for blocking IO
+	printf("server_read_write_data called\n");
+
+	// set socket for non-blocking IO
 	fcntl(spp->sock_fd, F_SETFL, opts);
 	opts = fcntl(spp->sock_fd, F_GETFL);
 	if (opts < 0) {
@@ -136,26 +149,54 @@ server_read_data (gpointer user_data) {
 		exit(EXIT_FAILURE);
 	}
 
-	opts &= ~O_NONBLOCK;
-	
-	if (fcntl(spp->sock_fd, F_SETFL,opts) < 0) {
+	opts &= O_NONBLOCK;
+
+	if (fcntl(spp->sock_fd, F_SETFL, opts) < 0) {
 		perror("fcntl(F_SETFL)");
 		exit(EXIT_FAILURE);
 	}
 
-	// read data from the client
-	bytes_read = read(spp->sock_fd, buf, sizeof(buf));
-	if ( bytes_read > 0 ) {
-		printf("received [%s]\n", buf);
-	} else {
-		printf("error reading from client [%d] %s\n", errno, strerror(errno));
-	}
+    // Make sure a minimum of 1 character is allowed, otherwise read
+    // will block waiting for more characters.
+    setsockopt(spp->sock_fd, SOL_SOCKET, SO_RCVLOWAT, &minLen, sizeof(minLen));
+
+    while (rv != -1) {
+        FD_ZERO(&set);
+        FD_SET(spp->sock_fd, &set);
+
+        timeout.tv_sec = 2;
+        timeout.tv_usec = 0;
+
+        rv = select(spp->sock_fd + 1, &set, NULL, NULL, &timeout);
+        if (rv == -1) {
+            perror("Error with read.\n");
+        } else if (rv == 0) {
+            printf("Timeout, looping\n");
+        } else if (FD_ISSET(spp->sock_fd, &set)) {
+            // read data from the client
+            printf("Reading data.\n");
+            bytes_read = read(spp->sock_fd, buf, sizeof(buf));
+            if ( bytes_read > 0 ) {
+                buf[bytes_read] = 0;
+                printf("received [%s]\n", buf);
+
+                wstatus = write(spp->sock_fd, buf, bytes_read);
+                if (wstatus < 0) {
+                    perror("client: write to socket failed!\n");
+                }
+
+            } else {
+                printf("error reading from client [%d] %s\n", errno, strerror(errno));
+                rv = -1;
+            }
+        }
+    }
 
 	// close connection
 	close(spp->sock_fd);
 
-	// all done!
-	g_main_loop_quit(spp->loop);
+	// all done, but continue to loop to accept the next connection
+	//g_main_loop_quit(spp->loop);
 
 	// make this a one-shot
 	return false;
@@ -166,21 +207,21 @@ client_write_data (gpointer user_data) {
 	int status;
 	struct spp_data *spp = user_data;
 
-	printf("client_write_data called\n");	
-	
+	printf("client_write_data called\n");
+
 	// read data from the client
 	status = write(spp->sock_fd, "Hello World!", 12);
 	if (status < 0) {
 		perror("client: write to socket failed!\n");
 	}
 
-	printf("client_write_data status OK!\n");		
+	printf("client_write_data status OK!\n");
 
 	// close connection
 	close(spp->sock_fd);
 
 	// all done!
-	g_main_loop_quit(spp->loop);	
+	g_main_loop_quit(spp->loop);
 
 	// make this a one-shot
 	return false;
@@ -208,7 +249,7 @@ on_handle_new_connection (OrgBluezProfile1 *interface,
 			gpointer              user_data)
 {
 	GDBusMessage *message;
-	GError *error = NULL;	
+	GError *error = NULL;
 	GUnixFDList *fd_list;
 	socklen_t optlen;
 	struct sockaddr_rc saddr;
@@ -238,16 +279,16 @@ on_handle_new_connection (OrgBluezProfile1 *interface,
 	}
 
 	print_bdaddr("handle_new_conn remote: ", &(spp->remote.rc_bdaddr));
-	
+
 	// finished with method call; no reply sent
 	g_dbus_method_invocation_return_value(invocation, NULL);
 
 	if (spp->server) {
-		g_idle_add(server_read_data, spp);
-	} else {	
+		g_idle_add(server_read_write_data, spp);
+	} else {
 		g_idle_add(client_write_data, spp);
 	}
-		
+
 	return TRUE;
 }
 
@@ -257,7 +298,7 @@ int main(int argc, char *argv[])
 	GDBusConnection *conn;
 	GError *error = NULL;
 	OrgBluezProfile1 *interface;
-	struct spp_data *spp;	
+	struct spp_data *spp;
 
 	spp = g_new0 (struct spp_data, 1);
 
@@ -271,7 +312,7 @@ int main(int argc, char *argv[])
 	}
 
 	spp->loop = g_main_loop_new (NULL, FALSE);
-	
+
 	conn = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, &error);
 	g_assert_no_error (error);
 
